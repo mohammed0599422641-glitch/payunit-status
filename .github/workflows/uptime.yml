@@ -1,0 +1,58 @@
+# Uptime monitor for Payunit (owner, 2026-11-06). Every 5 minutes it opens the main addresses.
+# Something down twice in a row → an issue «🔴 …» is opened (GitHub notifies the owner by app and email).
+# Back up → the issue gets a comment and is closed. Public repository: unlimited free minutes; nothing secret here.
+name: uptime
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+permissions:
+  issues: write
+  contents: write
+concurrency: { group: uptime, cancel-in-progress: false }
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check
+        id: check
+        run: |
+          set -u
+          down=""
+          check() { # name url expected-text
+            local code body
+            for try in 1 2; do
+              body="$(curl -sS -L --max-redirs 3 -m 20 -A 'payunit-uptime/1.0' -w '\n%{http_code}' "$2" 2>&1)" || true
+              code="${body##*$'\n'}"
+              if [ "$code" -ge 200 ] && [ "$code" -lt 400 ] && { [ -z "$3" ] || grep -q -- "$3" <<<"$body"; }; then echo "ok   $1 $code"; return; fi
+              sleep 20
+            done
+            echo "DOWN $1 (HTTP $code) $2"; down="$down\n- **$1** — HTTP $code — $2"
+          }
+          check "payunit.co"            "https://payunit.co/"                       ""
+          check "merchant API"          "https://payunit.co/api/v1/health"          ""
+          check "mobile API"            "https://api.payunit.co/v1/ping"            ""
+          check "stores platform"       "https://stores.payunit.co/login"           ""
+          check "www redirect"          "https://www.payunit.co/"                   ""
+          printf '%b' "$down" > down.txt
+          mkdir -p status; date -u +%FT%TZ > status/last-check.txt
+          if [ -s down.txt ]; then echo "state=down" >> "$GITHUB_OUTPUT"; else echo "state=up" >> "$GITHUB_OUTPUT"; fi
+      - name: Open or close the alert
+        env: { GH_TOKEN: '${{ github.token }}' }
+        run: |
+          open="$(gh issue list --state open --label down --json number --jq '.[0].number' || true)"
+          gh label create down --color B60205 --description 'A site is down' 2>/dev/null || true
+          if [ "${{ steps.check.outputs.state }}" = down ]; then
+            body="$(printf 'Not answering at %s UTC:\n%s\n\nChecked from GitHub (outside the server).' "$(date -u '+%F %H:%M')" "$(cat down.txt)")"
+            if [ -z "$open" ]; then gh issue create --title "🔴 Payunit: a site is down" --label down --body "$body"; else gh issue comment "$open" --body "$body"; fi
+          elif [ -n "$open" ]; then
+            gh issue comment "$open" --body "🟢 Everything answers again ($(date -u '+%F %H:%M') UTC)."; gh issue close "$open"
+          fi
+      - name: Keep the schedule alive (GitHub pauses schedules after 60 days without commits)
+        run: |
+          if [ "$(date -u +%H%M)" = "0300" ] || [ "$(date -u +%H%M)" = "0305" ]; then
+            git config user.name uptime-bot; git config user.email uptime-bot@users.noreply.github.com
+            git add status/last-check.txt && git commit -qm "status $(date -u +%F)" && git push -q || true
+          fi
